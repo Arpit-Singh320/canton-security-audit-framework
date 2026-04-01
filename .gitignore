@@ -1,0 +1,53 @@
+# Daml artifacts
+.daml/
+*.dar
+.env
+.env.*
+!/.env.example
+
+# JavaScript/TypeScript UI artifacts
+dist/
+node_modules/
+coverage/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*~
+*.swp
+.python-version
+
+# Python virtual environment
+venv/
+env/
+.venv/
+ENV/
+
+# Python package artifacts
+build/
+*.egg-info/
+*.egg
+wheelhouse/
+
+# Testing artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+.tox/
+.mypy_cache/
+
+# IDE specific
+.idea/
+.vscode/
+*.iml
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
