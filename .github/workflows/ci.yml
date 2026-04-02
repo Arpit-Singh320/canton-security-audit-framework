@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  run-analyzer:
+    name: Run Static Analyzer on Test Contracts
+    runs-on: ubuntu-latest
+    permissions:
+      # required for all workflows
+      security-events: write
+      # only required for workflows in private repositories
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r analyzer/requirements.txt
+
+      - name: Setup Daml SDK
+        uses: daml/setup-daml@v1
+        with:
+          sdk-version: 3.1.0
+
+      - name: Build Daml test contracts
+        # Assumes test contracts with known vulnerabilities are in test-contracts/
+        run: daml build --project-root test-contracts
+
+      - name: Run Daml static analyzer
+        id: run_analyzer
+        # This step runs the analyzer against the compiled DAR file.
+        # It generates a SARIF report, a standard format for static analysis results.
+        run: |
+          python -m analyzer \
+            --dar test-contracts/.daml/dist/*.dar \
+            --output daml-audit-report.sarif
+
+      - name: Upload SARIF report
+        # This action uploads the SARIF file to GitHub Security tab,
+        # which also implicitly validates the SARIF file format.
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: daml-audit-report.sarif
+          category: daml-security-analyzer
+        # Continue even if the upload fails, so we can run other checks.
+        continue-on-error: true
+
+      - name: Verify SARIF file was created
+        run: |
+          if [ ! -f "daml-audit-report.sarif" ]; then
+            echo "::error::SARIF report file was not generated."
+            exit 1
+          else
+            echo "SARIF report successfully generated."
+          fi
+          
+      - name: Archive analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-report
+          path: daml-audit-report.sarif
