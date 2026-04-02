@@ -1,0 +1,67 @@
+name: Daml Security Audit
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: Build, Test, and Audit Daml Contracts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Daml SDK
+        uses: daml/setup-daml@v1
+        with:
+          sdk-version: 3.1.0
+
+      - name: Build Daml project
+        run: daml build
+        working-directory: ${{ env.DAML_PROJECT_DIR || '.' }}
+
+      - name: Run Daml tests
+        run: daml test
+        working-directory: ${{ env.DAML_PROJECT_DIR || '.' }}
+
+      # The following steps demonstrate how to integrate the Canton Security Audit Framework.
+      # This workflow assumes it is being run in a project that uses the framework.
+      - name: Checkout Canton Security Audit Framework
+        uses: actions/checkout@v4
+        with:
+          # IMPORTANT: Replace with the actual repository of the audit framework
+          repository: your-org/canton-security-audit-framework
+          ref: v1.0.0 # Pin to a specific version for stable builds
+          path: ./.audit-tool
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install audit tool dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ./.audit-tool/requirements.txt
+        # Assumes the framework repository contains a requirements.txt file
+
+      - name: Run Daml static analysis scan
+        run: |
+          python ./.audit-tool/analyzer/reporter.py \
+            --source-dir daml \
+            --output-format github-annotations \
+            --fail-on-level HIGH
+        # ARGS:
+        # --source-dir: Points to the directory containing your Daml source files.
+        # --output-format: Creates annotations directly on the pull request for review.
+        # --fail-on-level: Fails the CI check if vulnerabilities of this level or higher are found.
+        #                  (Options: CRITICAL, HIGH, MEDIUM, LOW, INFO)
