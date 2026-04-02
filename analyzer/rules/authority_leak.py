@@ -1,202 +1,159 @@
-# Copyright (c) 2024 Digital Asset (Canton) GmbH and/or its affiliates. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+import re
+from typing import List, Dict, NamedTuple, Set, Optional
 
-import os
-from typing import List, Dict, Any, Set
-
-# This file defines a static analysis rule for detecting potential authority leaks
-# in Daml smart contracts. An authority leak occurs when a choice allows a party
-# to create a contract that confers signatory rights upon another party without
-# that other party's explicit consent within the choice's authorization context.
-#
-# The specific pattern we detect is:
-# A `create` statement inside a choice, where:
-# 1. The new contract has a signatory `S`.
-# 2. The party for `S` is provided via a choice parameter `p`.
-# 3. `p` is NOT listed as a controller of the choice.
-#
-# This allows the choice's controller `C` to create a contract obligating `p`
-# to be a signatory, which `p` never authorized in the context of this choice.
-# While the Canton ledger's transaction authorization rules would prevent this
-# transaction from succeeding without `p`'s signature, it represents a flaw
-# in the smart contract logic that should be caught by static analysis.
-
-class Finding:
-    """Represents a single vulnerability or issue found by a rule."""
-    def __init__(self, rule_id: str, file_path: str, line: int, message: str):
-        self.rule_id = rule_id
-        self.file_path = os.path.normpath(file_path)
-        self.line = line
-        self.message = message
-
-    def __repr__(self) -> str:
-        return f"{self.file_path}:{self.line}: [{self.rule_id}] {self.message}"
+class Finding(NamedTuple):
+    """
+    Represents a single vulnerability or issue found by a rule.
+    """
+    file_path: str
+    line_number: int
+    rule_id: str
+    description: str
+    confidence: str  # "High", "Medium", "Low"
 
 class AuthorityLeakRule:
     """
-    Detects when a choice creates a contract where a signatory is a party
-    provided as a choice argument, but that party is not a controller of the choice.
+    Identifies Authority Leak vulnerabilities in Daml contracts.
+    
+    ID: DA001
+    Description: This rule detects when a choice allows a controller to perform an action
+                 (e.g., creating a contract) that requires the authority of another party
+                 who is not a controller of the choice. This often occurs when data from a
+                 `fetch` operation is used to populate a signatory field in a `create` statement.
+
+    The improved logic specifically targets cases where a signatory of a new contract is not
+    in the controller set of the choice, and traces the signatory's value back to a fetched
+    contract, thereby excluding known-safe patterns where the controller is creating contracts
+    on their own behalf.
     """
     RULE_ID = "DA001"
-    DESCRIPTION = "Potential Authority Leak: A choice controller grants signatory rights to a non-controller party."
+    DESCRIPTION = "Potential authority leak: a choice action uses the authority of a non-controller party."
 
-    def analyze(self, ast: Dict[str, Any]) -> List[Finding]:
+    # Regex to find `template TemplateName ... where` blocks. Captures name and body.
+    TEMPLATE_RE = re.compile(
+        r"^\s*template\s+(\w+)\s+with.*?^\s*where\n(.*?)(?=^\s*template|\Z)",
+        re.DOTALL | re.MULTILINE
+    )
+
+    # Find `signatory ...` within the `where` block of a template
+    SIGNATORY_RE = re.compile(r"signatory\s+([()\w\s,.]+)")
+
+    # Find `choice ChoiceName ... controller ... do` blocks
+    CHOICE_RE = re.compile(
+        r"^\s*choice\s+.*?controller\s+([()\w\s,.]+)\s+do(.*?)(?=^\s*choice|^\s*template)",
+        re.DOTALL | re.MULTILINE
+    )
+    
+    # Find `choice Name...` to extract the name
+    CHOICE_NAME_RE = re.compile(r"^\s*choice\s+(\w+)", re.MULTILINE)
+
+    # Find `create TemplateName with ...` statements
+    CREATE_RE = re.compile(r"create\s+(\w+)\s+with\s+(.*)")
+
+    # Find `var <- fetch cid` statements
+    FETCH_RE = re.compile(r"^\s*([\w_]+)\s*<-\s*fetch\s+", re.MULTILINE)
+
+    def analyze(self, file_path: str, content: str) -> List[Finding]:
         """
-        Analyzes the given Daml project AST for authority leaks.
-
-        Args:
-            ast: The abstract syntax tree of the Daml project.
-
-        Returns:
-            A list of Finding objects representing detected vulnerabilities.
+        Analyzes the given Daml file content for authority leaks.
         """
-        findings: List[Finding] = []
-        templates_map = self._get_templates_map(ast)
+        findings = []
+        templates_signatories = self._get_templates_and_signatories(content)
 
-        for module in ast.get("modules", []):
-            for template in module.get("templates", []):
-                for choice in template.get("choices", []):
-                    findings.extend(self._check_choice(module, choice, templates_map))
-        return findings
+        for template_match in self.TEMPLATE_RE.finditer(content):
+            template_body = template_match.group(2)
+            
+            for choice_match in self.CHOICE_RE.finditer(template_body):
+                controllers_str = choice_match.group(1)
+                choice_body = choice_match.group(2)
+                
+                choice_name_match = self.CHOICE_NAME_RE.search(choice_match.group(0))
+                choice_name = choice_name_match.group(1) if choice_name_match else "UnnamedChoice"
 
-    def _get_templates_map(self, ast: Dict[str, Any]) -> Dict[str, Any]:
-        """Creates a flat map of template names to their definitions for easy lookup."""
-        templates_map: Dict[str, Any] = {}
-        for module in ast.get("modules", []):
-            module_name = module.get("name")
-            for template in module.get("templates", []):
-                template_name = template.get("name")
-                if not template_name:
-                    continue
-                # Store by both simple and fully qualified name if possible
-                templates_map[template_name] = template
-                if module_name:
-                    qualified_name = f"{module_name}.{template_name}"
-                    templates_map[qualified_name] = template
-        return templates_map
+                controllers = self._parse_party_list(controllers_str)
+                fetched_vars = {m.group(1) for m in self.FETCH_RE.finditer(choice_body)}
 
-    def _check_choice(self, module: Dict[str, Any], choice: Dict[str, Any], templates_map: Dict[str, Any]) -> List[Finding]:
-        """Checks a single choice for authority leak vulnerabilities."""
-        findings: List[Finding] = []
-        
-        # The set of authorizing parties are the controllers of the choice.
-        # These are treated as symbolic variable names for static analysis.
-        controller_vars: Set[str] = set(choice.get("controllers", []))
-
-        # The set of variables that are choice parameters.
-        choice_param_vars: Set[str] = set(choice.get("params", {}).keys())
-
-        for stmt in choice.get("body", []):
-            if stmt.get("type") == "create":
-                created_template_name = stmt.get("template")
-                if not created_template_name:
-                    continue
-
-                created_template_def = templates_map.get(created_template_name)
-                if not created_template_def:
-                    # Can't find the template definition, so we can't analyze its signatories.
-                    continue
-
-                signatory_fields: List[str] = created_template_def.get("signatories", [])
-                create_args: Dict[str, str] = stmt.get("args", {})
-
-                for sig_field in signatory_fields:
-                    # Find which variable is being used to populate this signatory field.
-                    source_var = create_args.get(sig_field)
+                for create_match in self.CREATE_RE.finditer(choice_body):
+                    created_template = create_match.group(1)
+                    create_args_str = create_match.group(2)
                     
-                    if not source_var:
-                        # This signatory field might be populated by a complex expression
-                        # (e.g., from `this` or a `let` binding). A more advanced analyzer
-                        # would use data-flow analysis. For this rule, we focus on the
-                        # most common vulnerability pattern: direct assignment from a choice param.
+                    if created_template not in templates_signatories:
                         continue
 
-                    # THE VULNERABILITY CONDITION:
-                    # The source of the signatory is a choice parameter, AND that parameter
-                    # is NOT also a controller of the choice.
-                    if source_var in choice_param_vars and source_var not in controller_vars:
-                        message = (
-                            f"In choice '{choice['name']}', a contract of template '{created_template_name}' is created. "
-                            f"Its signatory field '{sig_field}' is populated by the choice parameter '{source_var}'. "
-                            f"However, '{source_var}' is not a controller of the choice. "
-                            f"This allows a controller to grant signatory rights to '{source_var}' without their consent."
-                        )
-                        findings.append(Finding(
-                            rule_id=self.RULE_ID,
-                            file_path=module.get("path", "unknown_file"),
-                            line=stmt.get("line", choice.get("line")),
-                            message=message
-                        ))
+                    signatory_fields = templates_signatories[created_template]
+                    create_args = self._parse_with_block(create_args_str)
+
+                    for sig_field in signatory_fields:
+                        signatory_value = create_args.get(sig_field)
+                        if not signatory_value:
+                            continue
+
+                        # Core Logic: If the party providing signatory authority is not a 
+                        # controller of the choice, it's a potential leak.
+                        if signatory_value not in controllers:
+                            confidence, reason = self._assess_leak_confidence(signatory_value, fetched_vars)
+
+                            if confidence:
+                                line_number = self._get_line_number(content, choice_match.start(2) + create_match.start())
+                                findings.append(Finding(
+                                    file_path=file_path,
+                                    line_number=line_number,
+                                    rule_id=self.RULE_ID,
+                                    description=(
+                                        f"In choice '{choice_name}', contract '{created_template}' is created with "
+                                        f"signatory '{signatory_value}' which resolves to a party that is not a choice controller. "
+                                        f"{reason}"
+                                    ),
+                                    confidence=confidence
+                                ))
         return findings
 
-# Example usage for standalone testing of this rule.
-# In a real application, this would be orchestrated by a main runner.
-if __name__ == '__main__':
-    # This is a mock AST representing a vulnerable Daml contract.
-    # The structure is a simplified representation of what a real Daml parser might produce.
-    mock_ast = {
-        "modules": [
-            {
-                "name": "VulnerableModule",
-                "path": "daml/Vulnerable.daml",
-                "templates": [
-                    {
-                        "name": "MasterAgreement",
-                        "fields": {"operator": "Party", "counterparty": "Party"},
-                        "signatories": ["operator"],
-                        "choices": [
-                            {
-                                "name": "DelegateAdminRole_VULNERABLE",
-                                "line": 15,
-                                "params": {"newAdmin": "Party"},
-                                "controllers": ["operator"],
-                                "body": [
-                                    {
-                                        "type": "create",
-                                        "line": 18,
-                                        "template": "AdminRole",
-                                        "args": {"user": "newAdmin", "granter": "operator"}
-                                    }
-                                ]
-                            },
-                             {
-                                "name": "DelegateAdminRole_SAFE",
-                                "line": 25,
-                                "params": {"newAdmin": "Party"},
-                                "controllers": ["operator", "newAdmin"], # Correct: newAdmin must co-sign.
-                                "body": [
-                                    {
-                                        "type": "create",
-                                        "line": 28,
-                                        "template": "AdminRole",
-                                        "args": {"user": "newAdmin", "granter": "operator"}
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        "name": "AdminRole",
-                        "fields": {"user": "Party", "granter": "Party"},
-                        "signatories": ["user"],
-                        "choices": []
-                    }
-                ]
-            }
-        ]
-    }
+    def _assess_leak_confidence(self, signatory_value: str, fetched_vars: Set[str]) -> (Optional[str], str):
+        """
+        Determines the confidence level of a potential authority leak.
+        - High: The signatory value comes directly from a fetched contract.
+        - Medium: The signatory value is a variable, but not from a known safe source (like a controller).
+        """
+        if '.' in signatory_value:
+            base_var, _ = signatory_value.split('.', 1)
+            if base_var in fetched_vars:
+                return "High", "The signatory's authority is derived from a fetched contract."
 
-    rule = AuthorityLeakRule()
-    findings = rule.analyze(mock_ast)
+        # Exclude literals (e.g., hardcoded Party literals, though rare)
+        if signatory_value.startswith('"') or signatory_value.isdigit():
+            return None, ""
+            
+        return "Medium", "The signatory is a variable whose authority source could not be verified as safe."
 
-    print(f"--- Analysis Results for {rule.RULE_ID}: {rule.DESCRIPTION} ---")
-    if not findings:
-        print("No vulnerabilities found.")
-    else:
-        for f in findings:
-            print(f"\n[FOUND] {f}")
+    def _get_templates_and_signatories(self, content: str) -> Dict[str, Set[str]]:
+        """Parses the entire file to map template names to their signatory fields."""
+        results = {}
+        for template_match in self.TEMPLATE_RE.finditer(content):
+            template_name = template_match.group(1).strip()
+            template_body = template_match.group(2)
+            sig_match = self.SIGNATORY_RE.search(template_body)
+            if sig_match:
+                results[template_name] = self._parse_party_list(sig_match.group(1))
+        return results
     
-    assert len(findings) == 1
-    assert findings[0].line == 18
-    assert findings[0].rule_id == "DA001"
-    print("\nTest finished: Exactly one vulnerability was correctly identified.")
+    def _parse_party_list(self, party_str: str) -> Set[str]:
+        """Parses a comma-separated list of parties, handling parentheses."""
+        sanitized_str = party_str.replace('\n', ' ').strip()
+        if sanitized_str.startswith('(') and sanitized_str.endswith(')'):
+            sanitized_str = sanitized_str[1:-1]
+        
+        return {p.strip() for p in sanitized_str.split(',') if p.strip()}
+
+    def _parse_with_block(self, with_str: str) -> Dict[str, str]:
+        """A simple parser for `field1 = value1, field2 = value2`."""
+        args = {}
+        # This regex handles `key = value` pairs, ignoring commas within parentheses.
+        # This is a simplification; a full parser would be needed for complex cases.
+        arg_re = re.compile(r"(\w+)\s*=\s*([\w.'\"_]+)")
+        for match in arg_re.finditer(with_str):
+            args[match.group(1)] = match.group(2)
+        return args
+
+    def _get_line_number(self, content: str, char_index: int) -> int:
+        """Calculates the 1-based line number for a given character index."""
+        return content.count('\n', 0, char_index) + 1
